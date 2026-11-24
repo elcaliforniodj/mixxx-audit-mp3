@@ -5,6 +5,7 @@ audit_mp3.py - Pre-gig MP3 integrity, loudness, and transcode auditor.
 Scans MP3 libraries using `mp3val` and `ffmpeg` to catch corrupt frames,
 true-peak clipping, extreme loudness, low bitrates, and suspected "fake 320"
 transcodes, sorting results by fix priority and Date Modified (newest first).
+Automatically saves a timestamped report in the target directory by default.
 
 License: MIT
 """
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ==============================================================================
 # CONFIGURABLE THRESHOLDS
@@ -268,22 +269,30 @@ def main() -> None:
         help="Directory or single .mp3 file to scan (default: current directory)",
     )
     parser.add_argument("-r", "--recursive", action="store_true", help="Scan subdirectories recursively")
-    parser.add_argument("--issues-only", action="store_true", help="Only display tracks with warnings or errors")
+    parser.add_argument("--issues-only", action="store_true", help="Only display/save tracks with warnings or errors")
     parser.add_argument("-p", "--full-path", action="store_true", help="Display full file paths instead of filenames")
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Custom output file path (default: <target_dir>/audit_report_YYYY-MM-DD_HHMMSS.txt)",
+    )
+    parser.add_argument("--no-save", action="store_true", help="Print to terminal only without saving a report file")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args()
 
     check_dependencies()
 
-    target_path = Path(args.target)
+    target_path = Path(args.target).resolve()
     if not target_path.exists():
         sys.exit(f"Error: Path does not exist: {target_path}")
 
     if target_path.is_file():
         files = [target_path]
+        report_dir = target_path.parent
     else:
         glob_pattern = "**/*.mp3" if args.recursive else "*.mp3"
         files = [p for p in target_path.glob(glob_pattern) if p.is_file() and p.suffix.lower() == ".mp3"]
+        report_dir = target_path
 
     if not files:
         sys.exit(f"No MP3 files found in '{target_path}'.")
@@ -304,12 +313,13 @@ def main() -> None:
     must_fix_count = sum(1 for r in reports if r.worst_severity == SEV_CRITICAL)
     warn_count = sum(1 for r in reports if r.worst_severity in (SEV_HIGH, SEV_MINOR))
 
+    lines: list[str] = []
     for report in reports:
         display_name = str(report.path) if args.full_path else report.path.name
         if report.issues:
-            print(f"{report.status_tag} [{report.formatted_date}] {display_name}")
+            lines.append(f"{report.status_tag} [{report.formatted_date}] {display_name}")
             for issue in report.issues:
-                print(f"  - [{issue.tag}] {issue.message}")
+                lines.append(f"  - [{issue.tag}] {issue.message}")
         elif not args.issues_only:
             br = f"{int(report.metrics['Bitrate'])}k | " if "Bitrate" in report.metrics else ""
             stats = (
@@ -317,9 +327,28 @@ def main() -> None:
                 if all(k in report.metrics for k in ("I", "Peak", "LRA"))
                 else "Metrics unavailable"
             )
-            print(f"{report.status_tag} [{report.formatted_date}] {display_name} ({stats})")
+            lines.append(f"{report.status_tag} [{report.formatted_date}] {display_name} ({stats})")
 
-    print(f"\nSummary: {len(files)} scanned | {must_fix_count} must-fix | {warn_count} warnings")
+    lines.append(f"\nSummary: {len(files)} scanned | {must_fix_count} must-fix | {warn_count} warnings")
+    report_text = "\n".join(lines) + "\n"
+
+    print(report_text, end="")
+
+    if not args.no_save:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        output_path = Path(args.output) if args.output else report_dir / f"audit_report_{timestamp}.txt"
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            header = (
+                f"MP3 Audit Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Target: {target_path}\n"
+                f"{'-' * 72}\n"
+            )
+            output_path.write_text(header + report_text, encoding="utf-8")
+            print(f"Report saved to: {output_path}", file=sys.stderr)
+        except OSError as exc:
+            print(f"Warning: Could not save report to {output_path}: {exc}", file=sys.stderr)
+
     sys.exit(1 if (must_fix_count + warn_count) > 0 else 0)
 
 
